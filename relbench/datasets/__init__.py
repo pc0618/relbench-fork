@@ -18,6 +18,7 @@ from relbench.datasets import (
     ratebeer,
     salt,
     stack,
+    tabarena,
     trial,
 )
 from relbench.utils import get_relbench_cache_dir
@@ -74,6 +75,12 @@ def download_dataset(name: str) -> None:
         print(
             f"Dataset '{name}' is derived from 4DBInfer and must be generated "
             "locally; skipping download."
+        )
+        return
+    if name.startswith("tabarena-"):
+        print(
+            f"Dataset '{name}' is derived from TabArena OpenML tasks and must be "
+            "generated locally; skipping download."
         )
         return
 
@@ -157,3 +164,10 @@ register_dataset("dbinfer-seznam", dbinfer.DBInferSeznamDataset)
 register_dataset("dbinfer-amazon", dbinfer.DBInferAmazonDataset)
 register_dataset("dbinfer-stackexchange", dbinfer.DBInferStackExchangeDataset)
 register_dataset("dbinfer-outbrain-small", dbinfer.DBInferOutbrainSmallDataset)
+
+for dataset_slug in tabarena.get_tabarena_dataset_slugs():
+    register_dataset(
+        f"tabarena-{dataset_slug}",
+        tabarena.TabArenaDataset,
+        dataset_slug=dataset_slug,
+    )

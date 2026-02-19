@@ -9,6 +9,7 @@ import pooch
 
 from relbench.base import AutoCompleteTask, BaseTask, TaskType
 from relbench.datasets import get_dataset
+from relbench.datasets.tabarena import TABARENA_DATASETS
 from relbench.tasks import (
     amazon,
     arxiv,
@@ -20,6 +21,7 @@ from relbench.tasks import (
     mimic,
     ratebeer,
     stack,
+    tabarena,
     trial,
 )
 from relbench.utils import get_relbench_cache_dir
@@ -79,6 +81,12 @@ def download_task(dataset_name: str, task_name: str) -> None:
         print(
             f"Task '{dataset_name}/{task_name}' is derived from 4DBInfer and must be "
             "generated locally; skipping download."
+        )
+        return
+    if dataset_name.startswith("tabarena-"):
+        print(
+            f"Task '{dataset_name}/{task_name}' is derived from TabArena OpenML tasks "
+            "and must be generated locally; skipping download."
         )
         return
 
@@ -547,3 +555,13 @@ register_task("dbinfer-amazon", "churn", dbinfer.AmazonChurnTask)
 register_task("dbinfer-stackexchange", "churn", dbinfer.StackExchangeChurnTask)
 register_task("dbinfer-stackexchange", "upvote", dbinfer.StackExchangeUpvoteTask)
 register_task("dbinfer-outbrain-small", "ctr", dbinfer.OutbrainCTRTask)
+
+for dataset_slug, spec in TABARENA_DATASETS.items():
+    dataset_name = f"tabarena-{dataset_slug}"
+    for fold in range(spec.fold_count):
+        register_task(
+            dataset_name,
+            f"fold-{fold}",
+            tabarena.TabArenaFoldEntityTask,
+            fold=fold,
+        )
