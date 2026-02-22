@@ -1,11 +1,13 @@
 import argparse
 import os
+import random
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
+import torch
 
 from relbench.base import TaskType
 from relbench.datasets.tabarena import TABARENA_DATASETS, get_tabarena_dataset_slugs
@@ -16,22 +18,138 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
 
-try:
-    from tabpfn import TabPFNClassifier, TabPFNRegressor
-    from tabpfn.constants import ModelVersion
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "tabpfn is required for this script. Install it with:\n"
-        "  pip install tabpfn"
-    ) from exc
-
-from torch_geometric.seed import seed_everything
-
-
 HF_RESULTS_URL = (
     "https://huggingface.co/datasets/TabArena/benchmark_results/resolve/main/"
     "df_results.parquet"
 )
+
+INFERENCE_PRECISION_CHOICES = (
+    "auto",
+    "autocast",
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+)
+XLA_MATMUL_PRECISION_CHOICES = {"highest", "high", "medium"}
+_THREAD_CONFIG_CACHE: Optional[tuple[int, int]] = None
+
+
+def _import_tabpfn():
+    try:
+        from tabpfn import TabPFNClassifier, TabPFNRegressor
+        from tabpfn.constants import ModelVersion
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "tabpfn is required for this script. Install it with:\n"
+            "  pip install tabpfn"
+        ) from exc
+    return TabPFNClassifier, TabPFNRegressor, ModelVersion
+
+
+def _resolve_inference_precision(value: str) -> Any:
+    key = value.strip().lower()
+    if key in {"auto", "autocast"}:
+        return key
+
+    import torch
+
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    if key not in mapping:
+        raise ValueError(
+            f"Unknown inference precision {value!r}. Choices: {INFERENCE_PRECISION_CHOICES}"
+        )
+    return mapping[key]
+
+
+def _normalize_device(device: str) -> str:
+    normalized = device.strip().lower()
+    if normalized == "xla":
+        return "xla:0"
+    return normalized
+
+
+def _validate_device_runtime(device: str) -> None:
+    if not device.startswith("xla"):
+        return
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "device=xla requested but torch_xla is not installed. "
+            "Install torch-xla in the runtime environment."
+        ) from exc
+
+    if not hasattr(torch, "xla"):
+        torch.xla = torch_xla
+
+    xla_device = xm.xla_device()
+    if str(xla_device).lower() != str(device).lower():
+        print(f"[Runtime] requested device={device}, resolved_xla_device={xla_device}")
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _configure_runtime_env(
+    *,
+    pjrt_device: str,
+    xla_use_bf16: bool,
+    xla_downcast_bf16: bool,
+    xla_default_matmul_precision: str,
+    xla_flags: str,
+    torch_num_threads: int,
+    torch_num_interop_threads: int,
+) -> None:
+    global _THREAD_CONFIG_CACHE
+
+    if pjrt_device:
+        os.environ["PJRT_DEVICE"] = pjrt_device
+    if xla_use_bf16:
+        os.environ["XLA_USE_BF16"] = "1"
+    if xla_downcast_bf16:
+        os.environ["XLA_DOWNCAST_BF16"] = "1"
+    if xla_default_matmul_precision:
+        precision = xla_default_matmul_precision.strip().lower()
+        if precision not in XLA_MATMUL_PRECISION_CHOICES:
+            raise ValueError(
+                "xla_default_matmul_precision must be one of "
+                f"{sorted(XLA_MATMUL_PRECISION_CHOICES)}"
+            )
+        os.environ["XLA_DEFAULT_MATMUL_PRECISION"] = precision
+    if xla_flags:
+        os.environ["XLA_FLAGS"] = xla_flags
+
+    thread_cfg = (int(torch_num_threads), int(torch_num_interop_threads))
+    if thread_cfg == (0, 0):
+        return
+
+    if _THREAD_CONFIG_CACHE is None:
+        import torch
+
+        if torch_num_threads > 0:
+            torch.set_num_threads(torch_num_threads)
+        if torch_num_interop_threads > 0:
+            torch.set_num_interop_threads(torch_num_interop_threads)
+        _THREAD_CONFIG_CACHE = thread_cfg
+        return
+
+    if _THREAD_CONFIG_CACHE != thread_cfg:
+        raise ValueError(
+            "torch thread settings were already configured earlier in this process as "
+            f"{_THREAD_CONFIG_CACHE}, cannot switch to {thread_cfg}."
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -98,6 +216,70 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Ignore TabPFN pre-training limits; required for some feature/sample sizes."
         ),
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help=(
+            "TabPFN device spec (e.g. cpu, cuda, auto, xla, xla:0). "
+            "Use xla/xla:0 with torch-xla on TPU VMs."
+        ),
+    )
+    parser.add_argument(
+        "--inference_precision",
+        type=str,
+        default="auto",
+        choices=INFERENCE_PRECISION_CHOICES,
+        help="TabPFN inference precision override.",
+    )
+    parser.add_argument(
+        "--pjrt_device",
+        type=str,
+        default="",
+        help="If set, exports PJRT_DEVICE before TabPFN model construction (e.g. TPU).",
+    )
+    parser.add_argument(
+        "--xla_use_bf16",
+        action="store_true",
+        default=False,
+        help="Set XLA_USE_BF16=1 for TPU execution.",
+    )
+    parser.add_argument(
+        "--xla_downcast_bf16",
+        action="store_true",
+        default=False,
+        help="Set XLA_DOWNCAST_BF16=1 for TPU execution.",
+    )
+    parser.add_argument(
+        "--xla_default_matmul_precision",
+        type=str,
+        default="",
+        help="Set XLA_DEFAULT_MATMUL_PRECISION to one of: highest, high, medium.",
+    )
+    parser.add_argument(
+        "--xla_flags",
+        type=str,
+        default="",
+        help="Optional XLA_FLAGS string.",
+    )
+    parser.add_argument(
+        "--torch_num_threads",
+        type=int,
+        default=0,
+        help="If >0, call torch.set_num_threads(n).",
+    )
+    parser.add_argument(
+        "--torch_num_interop_threads",
+        type=int,
+        default=0,
+        help="If >0, call torch.set_num_interop_threads(n).",
+    )
+    parser.add_argument(
+        "--log_runtime_config",
+        action="store_true",
+        default=False,
+        help="Print runtime config/env values before execution.",
     )
     parser.add_argument(
         "--output_csv",
@@ -265,12 +447,49 @@ def run_tabarena_fold(
     n_estimators: int = 8,
     n_preprocessing_jobs: int = 1,
     ignore_pretraining_limits: bool = False,
+    device: str = "cpu",
+    inference_precision: str = "auto",
+    pjrt_device: str = "",
+    xla_use_bf16: bool = False,
+    xla_downcast_bf16: bool = False,
+    xla_default_matmul_precision: str = "",
+    xla_flags: str = "",
+    torch_num_threads: int = 0,
+    torch_num_interop_threads: int = 0,
+    log_runtime_config: bool = False,
 ) -> dict:
     if fold < 0 or fold >= TABARENA_DATASETS[dataset_slug].fold_count:
         raise ValueError(
             f"Fold {fold} is invalid for {dataset_slug}. "
             f"Valid range is [0, {TABARENA_DATASETS[dataset_slug].fold_count - 1}]."
         )
+
+    normalized_device = _normalize_device(device)
+
+    _configure_runtime_env(
+        pjrt_device=pjrt_device,
+        xla_use_bf16=xla_use_bf16,
+        xla_downcast_bf16=xla_downcast_bf16,
+        xla_default_matmul_precision=xla_default_matmul_precision,
+        xla_flags=xla_flags,
+        torch_num_threads=torch_num_threads,
+        torch_num_interop_threads=torch_num_interop_threads,
+    )
+
+    if log_runtime_config:
+        print(
+            "[Runtime] "
+            f"device={normalized_device} inference_precision={inference_precision} "
+            f"PJRT_DEVICE={os.getenv('PJRT_DEVICE', '')} "
+            f"XLA_USE_BF16={os.getenv('XLA_USE_BF16', '')} "
+            f"XLA_DOWNCAST_BF16={os.getenv('XLA_DOWNCAST_BF16', '')} "
+            f"XLA_DEFAULT_MATMUL_PRECISION={os.getenv('XLA_DEFAULT_MATMUL_PRECISION', '')}"
+        )
+
+    _validate_device_runtime(normalized_device)
+
+    TabPFNClassifier, TabPFNRegressor, ModelVersion = _import_tabpfn()
+    resolved_inference_precision = _resolve_inference_precision(inference_precision)
 
     run_tic = time.time()
     dataset_name = f"tabarena-{dataset_slug}"
@@ -298,8 +517,7 @@ def run_tabarena_fold(
     y_train = train_table.df[task.target_col].to_numpy(copy=True)
     X_val = val_df[feature_cols]
     X_test = test_df[feature_cols]
-    seed_everything(seed)
-    np.random.seed(seed)
+    _seed_everything(seed)
     if sample_size > 0 and sample_size < len(X_train):
         sampled_idx = np.random.permutation(len(X_train))[:sample_size]
         X_train = X_train.iloc[sampled_idx]
@@ -316,7 +534,8 @@ def run_tabarena_fold(
         model = TabPFNRegressor.create_default_for_version(
             ModelVersion.V2,
             n_estimators=n_estimators,
-            device="cpu",
+            device=normalized_device,
+            inference_precision=resolved_inference_precision,
             ignore_pretraining_limits=ignore_pretraining_limits,
             n_preprocessing_jobs=n_preprocessing_jobs,
             random_state=seed,
@@ -327,7 +546,8 @@ def run_tabarena_fold(
             ModelVersion.V2,
             n_estimators=n_estimators,
             categorical_features_indices=categorical_feature_indices,
-            device="cpu",
+            device=normalized_device,
+            inference_precision=resolved_inference_precision,
             ignore_pretraining_limits=ignore_pretraining_limits,
             n_preprocessing_jobs=n_preprocessing_jobs,
             random_state=seed,
@@ -336,16 +556,42 @@ def run_tabarena_fold(
 
     # The first fit also warms up and downloads weights if needed.
     model.fit(X_train_t, y_train)
+
+    if normalized_device.startswith("xla"):
+        executor = getattr(model, "executor_", None)
+        toggle = getattr(executor, "use_torch_inference_mode", None)
+        if callable(toggle):
+            # TabPFN re-enables torch.inference_mode() during predict(); on torch-xla
+            # this can fail with "Cannot set version_counter for inference tensor".
+            toggle(use_inference=False)
+
+            def _keep_inference_mode_off(*, use_inference: bool) -> None:
+                return None
+
+            executor.use_torch_inference_mode = _keep_inference_mode_off
+
     model_train_seconds = float(time.time() - model_tic)
 
-    if task.task_type == TaskType.REGRESSION:
-        train_pred = model.predict(X_train_t)
-        val_pred = model.predict(X_val_t)
-        test_pred = model.predict(X_test_t)
-    else:
-        train_pred = model.predict_proba(X_train_t)
-        val_pred = model.predict_proba(X_val_t)
-        test_pred = model.predict_proba(X_test_t)
+    restore_is_tracing = None
+    if normalized_device.startswith("xla"):
+        # TabPFN uses torch.Generator(device=xla:0) for positional embeddings.
+        # On current torch-xla/libtpu this raises "XLA device type not an accelerator".
+        # Forcing the tracing path skips the device-bound generator creation.
+        restore_is_tracing = torch.jit.is_tracing
+        torch.jit.is_tracing = lambda: True
+
+    try:
+        if task.task_type == TaskType.REGRESSION:
+            train_pred = model.predict(X_train_t)
+            val_pred = model.predict(X_val_t)
+            test_pred = model.predict(X_test_t)
+        else:
+            train_pred = model.predict_proba(X_train_t)
+            val_pred = model.predict_proba(X_val_t)
+            test_pred = model.predict_proba(X_test_t)
+    finally:
+        if restore_is_tracing is not None:
+            torch.jit.is_tracing = restore_is_tracing
 
     train_metrics = task.evaluate(train_pred, target_table=train_table)
     val_metrics = task.evaluate(val_pred, target_table=val_table)
@@ -373,6 +619,14 @@ def run_tabarena_fold(
         "num_estimators": int(n_estimators),
         "sample_size": int(sample_size),
         "seed": int(seed),
+        "device": str(normalized_device),
+        "inference_precision": str(inference_precision),
+        "pjrt_device": os.getenv("PJRT_DEVICE", ""),
+        "xla_use_bf16": os.getenv("XLA_USE_BF16", ""),
+        "xla_downcast_bf16": os.getenv("XLA_DOWNCAST_BF16", ""),
+        "xla_default_matmul_precision": os.getenv("XLA_DEFAULT_MATMUL_PRECISION", ""),
+        "torch_num_threads": int(torch_num_threads),
+        "torch_num_interop_threads": int(torch_num_interop_threads),
         "train_rows": int(len(X_train)),
         "val_rows": int(len(X_val)),
         "test_rows": int(len(X_test)),
@@ -415,6 +669,16 @@ def main() -> None:
         n_estimators=args.n_estimators,
         n_preprocessing_jobs=args.n_preprocessing_jobs,
         ignore_pretraining_limits=args.ignore_pretraining_limits,
+        device=args.device,
+        inference_precision=args.inference_precision,
+        pjrt_device=args.pjrt_device,
+        xla_use_bf16=args.xla_use_bf16,
+        xla_downcast_bf16=args.xla_downcast_bf16,
+        xla_default_matmul_precision=args.xla_default_matmul_precision,
+        xla_flags=args.xla_flags,
+        torch_num_threads=args.torch_num_threads,
+        torch_num_interop_threads=args.torch_num_interop_threads,
+        log_runtime_config=args.log_runtime_config,
     )
 
     print(f"Dataset={row['dataset_name']} Task={row['task_name']}")

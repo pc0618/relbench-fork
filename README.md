@@ -154,6 +154,10 @@ New example: temporal recommendation with TGN + attention:
 python examples/tgn_attention_recommendation.py --dataset rel-f1 --task driver-race-compete --download
 ```
 
+TabPFN GPU + GCS workflow (including bootstrap from a machine that only has
+`relational-transformer` checked out):
+`examples/TABPFN_GPU_GETTING_STARTED.md`.
+
 
 # Package Usage
 
